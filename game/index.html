@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Star Catcher — one prompt, one game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0f1226; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { position: relative; width: min(100vw, 177.78vh); aspect-ratio: 16 / 9; }
+  canvas { display: block; width: 100%; height: 100%; border-radius: 12px;
+           box-shadow: 0 0 60px rgba(120, 90, 255, .35); background: #141838; }
+  #hint { position: absolute; left: 0; right: 0; bottom: 10px; text-align: center;
+          color: rgba(255,255,255,.55); font-size: 14px; pointer-events: none;
+          letter-spacing: .04em; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">Move with mouse, arrow keys or touch &mdash; catch the stars, dodge the rocks</div>
+</div>
+<script>
+"use strict";
+/* Star Catcher — a tiny browser game built from one prompt.
+   Catch falling stars in 60 seconds. Golden stars are worth 5.
+   Rocks cost a life. Three lives. Built with plain canvas, no libraries. */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+const params = new URLSearchParams(location.search);
+const AUTOPLAY = params.get("autoplay") === "1";
+const AUTOSTART = params.get("autostart") === "1";
+
+const basket = { x: W / 2, w: 110, h: 18, y: H - 46, speed: 520, targetX: W / 2 };
+let items = [];          // falling {x, y, vy, r, kind: 'star'|'gold'|'rock', rot, vr}
+let parts = [];          // sparkle particles {x, y, vx, vy, life, color}
+let score = 0, lives = 3, timeLeft = 60, elapsed = 0;
+let state = "title";     // title | playing | over
+let spawnT = 0, shake = 0;
+let keys = {};
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function spawn() {
+  const roll = Math.random();
+  const kind = roll < 0.62 ? "star" : roll < 0.78 ? "gold" : "rock";
+  const r = kind === "rock" ? rand(16, 22) : rand(13, 17);
+  // Precompute the rock's outline once: drawing it with fresh random
+  // radii every frame made it wobble. Stars keep a fixed radius.
+  const pts = kind === "rock"
+    ? Array.from({ length: 7 }, (_, i) => {
+        const a = (i / 7) * Math.PI * 2;
+        return [Math.cos(a) * r * rand(0.82, 1.05), Math.sin(a) * r * rand(0.82, 1.05)];
+      })
+    : null;
+  items.push({
+    x: rand(30, W - 30), y: -24,
+    vy: rand(140, 210) + elapsed * 2.2,
+    r, kind, rot: rand(0, Math.PI * 2), vr: rand(-2.4, 2.4), pts,
+  });
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(40, 220);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 60,
+                 life: rand(0.35, 0.7), max: 0.7, color });
+  }
+}
+
+function startGame() {
+  score = 0; lives = 3; timeLeft = 60; elapsed = 0;
+  items = []; parts = []; spawnT = 0;
+  basket.x = W / 2; basket.targetX = W / 2;
+  state = "playing";
+}
+
+function drawStar(x, y, r, rot, color) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rr = i % 2 === 0 ? r : r * 0.45;
+    const a = (i * Math.PI) / 5 - Math.PI / 2;
+    ctx[i === 0 ? "moveTo" : "lineTo"](Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 14;
+  ctx.fill(); ctx.restore();
+}
+
+function drawRock(x, y, r, rot, pts) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.beginPath();
+  pts.forEach(([px, py], i) => ctx[i === 0 ? "moveTo" : "lineTo"](px, py));
+  ctx.closePath();
+  ctx.fillStyle = "#8a8fa8"; ctx.fill();
+  ctx.strokeStyle = "#5c6178"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.restore();
+}
+
+function drawBackground(t) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#141838"); g.addColorStop(1, "#1d2350");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // twinkling background stars
+  ctx.fillStyle = "#ffffff";
+  for (let i = 0; i < 70; i++) {
+    const sx = (i * 137.5) % W, sy = (i * 89.3) % (H * 0.7);
+    const tw = 0.25 + 0.55 * Math.abs(Math.sin(t * 1.4 + i));
+    ctx.globalAlpha = tw * 0.7;
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+  // moon
+  ctx.beginPath(); ctx.arc(W - 90, 70, 34, 0, Math.PI * 2);
+  ctx.fillStyle = "#f5f0c8"; ctx.shadowColor = "#f5f0c8"; ctx.shadowBlur = 30;
+  ctx.fill(); ctx.shadowBlur = 0;
+}
+
+function drawBasket() {
+  ctx.save();
+  ctx.translate(basket.x, basket.y);
+  ctx.fillStyle = "#ffcf4d";
+  ctx.beginPath();
+  ctx.moveTo(-basket.w / 2, 0);
+  ctx.lineTo(basket.w / 2, 0);
+  ctx.lineTo(basket.w / 2 - 12, basket.h);
+  ctx.lineTo(-basket.w / 2 + 12, basket.h);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#e8a91c";
+  ctx.fillRect(-basket.w / 2, 0, basket.w, 5);
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "700 26px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("SCORE  " + score, 22, 40);
+  ctx.textAlign = "center";
+  ctx.fillText(Math.ceil(timeLeft) + "s", W / 2, 40);
+  ctx.textAlign = "right";
+  ctx.fillText("♥".repeat(Math.max(lives, 0)) + "♡".repeat(Math.max(3 - lives, 0)), W - 22, 40);
+  // progress bar for the 60 seconds
+  ctx.fillStyle = "rgba(255,255,255,.18)";
+  ctx.fillRect(22, 52, W - 44, 6);
+  ctx.fillStyle = "#7ee787";
+  ctx.fillRect(22, 52, (W - 44) * (timeLeft / 60), 6);
+}
+
+function drawTitle(t) {
+  drawBackground(t);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffd94d";
+  ctx.font = "800 64px 'Segoe UI', system-ui, sans-serif";
+  ctx.shadowColor = "#ffd94d"; ctx.shadowBlur = 24;
+  ctx.fillText("STAR CATCHER", W / 2, 190);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "400 24px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("Catch the falling stars. 60 seconds. 3 lives.", W / 2, 245);
+  ctx.fillStyle = "#9aa3ff";
+  ctx.font = "600 22px 'Segoe UI', system-ui, sans-serif";
+  const blink = 0.6 + 0.4 * Math.sin(t * 4);
+  ctx.globalAlpha = blink;
+  ctx.fillText(AUTOPLAY ? "demo mode — the agent is playing" : "Click or press Space to start", W / 2, 320);
+  ctx.globalAlpha = 1;
+  drawStar(W / 2 - 150, 420, 22, t, "#ffd94d");
+  drawStar(W / 2, 440, 16, -t * 0.7, "#ffffff");
+  drawStar(W / 2 + 150, 420, 22, t * 0.5, "#ff9ecf");
+  ctx.fillStyle = "rgba(255,255,255,.45)";
+  ctx.font = "400 15px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("one prompt · one agent · one game", W / 2, 505);
+}
+
+function drawOver() {
+  drawBackground(0);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "800 54px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("TIME'S UP!", W / 2, 200);
+  ctx.fillStyle = "#ffd94d";
+  ctx.font = "700 40px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("Final score: " + score, W / 2, 275);
+  ctx.fillStyle = "#9aa3ff";
+  ctx.font = "400 22px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText(score >= 40 ? "Star-class catching. Play again?" :
+              score >= 20 ? "Solid run. One more go?" :
+              "Warm-up done. Try again!", W / 2, 330);
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "600 20px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("Click or press Space to play again", W / 2, 400);
+  ctx.globalAlpha = 1;
+}
+
+function update(dt) {
+  elapsed += dt;
+  timeLeft = Math.max(0, 60 - elapsed);
+  if (timeLeft <= 0) { state = "over"; return; }
+
+  // basket movement
+  if (AUTOPLAY) {
+    let best = null;
+    for (const it of items) {
+      if (it.kind === "star" || it.kind === "gold") {
+        if (!best || it.y > best.y) best = it;
+      }
+    }
+    if (best) basket.targetX = best.x;
+    const dx = basket.targetX - basket.x;
+    basket.x += Math.max(-basket.speed * dt, Math.min(basket.speed * dt, dx));
+  } else {
+    if (keys["ArrowLeft"] || keys["a"]) basket.x -= basket.speed * dt;
+    if (keys["ArrowRight"] || keys["d"]) basket.x += basket.speed * dt;
+    basket.x += (basket.targetX - basket.x) * Math.min(1, dt * 14);
+  }
+  basket.x = Math.max(basket.w / 2, Math.min(W - basket.w / 2, basket.x));
+
+  // spawn faster as time passes
+  spawnT -= dt;
+  if (spawnT <= 0) { spawn(); spawnT = rand(0.35, 0.8) - elapsed * 0.003; }
+
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy * dt; it.rot += it.vr * dt;
+    const caught = it.y + it.r >= basket.y - 4 && it.y <= basket.y + basket.h &&
+                   Math.abs(it.x - basket.x) < basket.w / 2 + it.r * 0.4;
+    if (caught) {
+      if (it.kind === "rock") {
+        lives -= 1; shake = 12;
+        burst(it.x, it.y, "#ff6b6b", 18);
+        if (lives <= 0) { state = "over"; return; }
+      } else {
+        score += it.kind === "gold" ? 5 : 1;
+        burst(it.x, it.y, it.kind === "gold" ? "#ffd94d" : "#9adcff", 12);
+      }
+      items.splice(i, 1);
+    } else if (it.y - it.r > H) {
+      items.splice(i, 1);
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 40);
+}
+
+function render(t) {
+  ctx.save();
+  if (shake > 0) ctx.translate(rand(-shake, shake) * 0.4, rand(-shake, shake) * 0.4);
+  drawBackground(t);
+  if (state === "title") { drawTitle(t); ctx.restore(); return; }
+  if (state === "over") { drawOver(); ctx.restore(); return; }
+  for (const it of items) {
+    if (it.kind === "rock") drawRock(it.x, it.y, it.r, it.rot, it.pts);
+    else drawStar(it.x, it.y, it.r, it.rot, it.kind === "gold" ? "#ffd94d" : "#ffffff");
+  }
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  drawBasket();
+  drawHUD();
+  ctx.restore();
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (state === "playing") update(dt);
+  render(now / 1000);
+  requestAnimationFrame(loop);
+}
+
+addEventListener("keydown", (e) => {
+  keys[e.key] = true;
+  if ((e.key === " " || e.key === "Enter") && state !== "playing") startGame();
+  if (e.key.startsWith("Arrow")) e.preventDefault();
+});
+addEventListener("keyup", (e) => { keys[e.key] = false; });
+cv.addEventListener("pointermove", (e) => {
+  const r = cv.getBoundingClientRect();
+  basket.targetX = ((e.clientX - r.left) / r.width) * W;
+});
+cv.addEventListener("pointerdown", (e) => {
+  if (state !== "playing") startGame();
+  else {
+    const r = cv.getBoundingClientRect();
+    basket.targetX = ((e.clientX - r.left) / r.width) * W;
+  }
+});
+
+if (AUTOSTART) startGame();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
